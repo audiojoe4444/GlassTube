@@ -56,6 +56,16 @@ API_KEY: "",   // optional
 
 > **Client secret in a public repo:** for the "TVs and Limited Input devices" client type, Google treats the secret as non-confidential, because it ships inside every TV app. Your account is still protected, since every sign-in has to be approved on your phone.
 
+## Automatic backup to GitHub (optional, recommended)
+
+Glasses software updates can wipe a web app's saved data. GlassTube can keep an **encrypted** copy of your settings, Google sign-in, recent searches and watch progress in a private gist in *your own* GitHub account, and restore it automatically.
+
+1. On github.com, go to profile picture → **Settings → Developer settings → Personal access tokens → Tokens (classic) → Generate new token (classic)**. Name it, set *No expiration*, tick **only `gist`**, and copy the key (it starts `ghp_`). You can reuse the same key as GlassCast.
+2. In the **Meta AI app**, edit GlassTube's web-app address so it ends with `?sync=ghp_yourkey` (use `&sync=` if the address already has a `?`).
+3. Open GlassTube → **Settings**. Under your name it should say **"● Backed up to GitHub · just now"**.
+
+The key only ever lives in the app address, never in the code or the repo. The backup is a secret gist called `glasstube-backup.json`, encrypted with AES-256 using a key made from your token. If the key ever leaks, delete it in GitHub's token settings and make a new one. A backup made with the old key is never overwritten. Settings will say "made with a different key", and you can delete the old gist on gist.github.com to start fresh.
+
 ## Controls
 
 | Gesture / key | Action |
@@ -72,4 +82,4 @@ API_KEY: "",   // optional
 - **Some videos won't play:** a few uploaders block playback outside youtube.com, and those videos show a message instead. Ads can still appear, because they come from YouTube's own player.
 - **Updating:** edit or upload files on GitHub and the glasses pick up the change on the next launch.
 
-Version 1.0.0
+Version 1.1.0

@@ -218,6 +218,9 @@ svg text { fill: currentColor; stroke: none; font: 700 7.2px system-ui, sans-ser
 .tog.on { background: var(--grad); }
 .tog.on::after { left: 25px; background: #fff; }
 .pillv { padding: 5px 12px; border-radius: 10px; background: rgba(255, 255, 255, .12); font-size: 16px; }
+.bk { color: var(--ink2); font-size: 14px; margin: -8px 24px 12px; }
+.bk.ok::before { content: "● "; color: #4ade80; }
+.bk.auth, .bk.different { color: #ffb4a8; }
 .ver { text-align: center; color: var(--ink3); font-size: 13px; margin: 14px 0 30px; }
 
 /* ---------- toast ---------- */

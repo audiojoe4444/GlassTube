@@ -3,7 +3,7 @@
 (function () {
   "use strict";
 
-  var VERSION = "1.0.0";
+  var VERSION = "1.1.0";
   var CFG = window.GT_CONFIG || {};
   var SCOPE = "https://www.googleapis.com/auth/youtube.readonly";
   var TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -14,12 +14,202 @@
   /* ---------------- storage ---------------- */
   var store = {
     get: function (k, d) { try { var v = localStorage.getItem("gt." + k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
-    set: function (k, v) { try { localStorage.setItem("gt." + k, JSON.stringify(v)); } catch (e) { pruneCache(); try { localStorage.setItem("gt." + k, JSON.stringify(v)); } catch (e2) {} } },
-    del: function (k) { try { localStorage.removeItem("gt." + k); } catch (e) {} }
+    set: function (k, v) { try { localStorage.setItem("gt." + k, JSON.stringify(v)); } catch (e) { pruneCache(); try { localStorage.setItem("gt." + k, JSON.stringify(v)); } catch (e2) {} } if (Backup) Backup.changed(k, v); },
+    del: function (k) { try { localStorage.removeItem("gt." + k); } catch (e) {} if (Backup) Backup.changed(k, null); }
   };
+  var Backup = null;
   function pruneCache() {
     try { Object.keys(localStorage).forEach(function (k) { if (k.indexOf("gt.c.") === 0) localStorage.removeItem(k); }); } catch (e) {}
   }
+
+  /* ---------------- encrypted backup to the user's own GitHub (secret gist) ----------------
+     Glasses software updates can wipe web-app storage. If the app address contains ?sync=<GitHub token>
+     (classic token, "gist" permission only), GlassTube keeps an AES-256 encrypted copy of your settings,
+     sign-in, search history and watch progress in a private gist and restores it automatically.
+     The key is never stored in the code or the repo — only in the app address in the Meta AI app. */
+  Backup = (function () {
+    var FILE = "glasstube-backup.json", GH = "https://api.github.com";
+    var token = readKey();
+    var gistId = null, ready = false, busy = false, pending = false, different = false, applying = false;
+    var timer = null, dueAt = 0, lastPush = 0, retry = null;
+    var lastRT = (store.get("auth", null) || {}).refresh_token || null;
+    var st = { state: token ? "checking" : "off", at: store.get("bk.at", 0) };
+    var keyCache = null, sessionSalt = null;
+
+    function readKey() {
+      try {
+        var k = new URLSearchParams(location.search).get("sync");
+        if (!k && location.hash) k = new URLSearchParams(location.hash.slice(1)).get("sync");
+        return k ? k.trim() : null;
+      } catch (e) { return null; }
+    }
+
+    /* crypto: PBKDF2-SHA256 (150k) over the token -> AES-GCM-256 */
+    var te = new TextEncoder(), td = new TextDecoder();
+    function b64(buf) { var s = "", b = new Uint8Array(buf); for (var i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000)); return btoa(s); }
+    function unb64(str) { var bin = atob(str), b = new Uint8Array(bin.length); for (var i = 0; i < bin.length; i++) b[i] = bin.charCodeAt(i); return b; }
+    function derive(salt) {
+      return crypto.subtle.importKey("raw", te.encode(token), "PBKDF2", false, ["deriveKey"]).then(function (base) {
+        return crypto.subtle.deriveKey({ name: "PBKDF2", salt: salt, iterations: 150000, hash: "SHA-256" }, base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+      });
+    }
+    function seal(obj) {
+      if (!keyCache) { sessionSalt = crypto.getRandomValues(new Uint8Array(16)); keyCache = derive(sessionSalt); }
+      var iv = crypto.getRandomValues(new Uint8Array(12)), salt = sessionSalt;
+      return keyCache.then(function (k) { return crypto.subtle.encrypt({ name: "AES-GCM", iv: iv }, k, te.encode(JSON.stringify(obj))); })
+        .then(function (ct) { return JSON.stringify({ app: "GlassTube", v: 1, salt: b64(salt), iv: b64(iv), data: b64(ct) }); });
+    }
+    function unseal(text) {
+      var f = JSON.parse(text);
+      return derive(unb64(f.salt)).then(function (k) { return crypto.subtle.decrypt({ name: "AES-GCM", iv: unb64(f.iv) }, k, unb64(f.data)); })
+        .then(function (pt) { return JSON.parse(td.decode(pt)); });
+    }
+
+    /* GitHub API */
+    function gh(method, path, body) {
+      var json = body ? JSON.stringify(body) : undefined;
+      var opts = { method: method, headers: { Authorization: "Bearer " + token, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" } };
+      if (json) { opts.body = json; opts.headers["Content-Type"] = "application/json"; if (json.length < 60000) opts.keepalive = true; }
+      return fetch(GH + path, opts).then(function (r) {
+        var e;
+        if (r.status === 401) { e = new Error("auth"); e.code = "auth"; throw e; }
+        if (r.status === 404) { e = new Error("missing"); e.code = 404; throw e; }
+        if (r.status === 403 && r.headers.get("x-ratelimit-remaining") !== "0") { e = new Error("auth"); e.code = "auth"; throw e; }
+        if (!r.ok) throw new Error("http " + r.status);
+        return r.status === 204 ? null : r.json();
+      });
+    }
+    function findGist() {
+      var id = store.get("bk.id", null);
+      function search(page) {
+        return gh("GET", "/gists?per_page=100&page=" + page).then(function (list) {
+          var g = (list || []).filter(function (x) { return x.files && x.files[FILE]; })[0];
+          if (g) { store.set("bk.id", g.id); return gh("GET", "/gists/" + g.id); }
+          if (list && list.length === 100 && page < 20) return search(page + 1);
+          return null;
+        });
+      }
+      if (id) return gh("GET", "/gists/" + id).catch(function (e) { if (e.code === 404) { store.del("bk.id"); return search(1); } throw e; });
+      return search(1);
+    }
+    function fileText(g) {
+      var f = g.files && g.files[FILE];
+      if (!f) return Promise.resolve(null);
+      if (f.truncated && f.raw_url) return fetch(f.raw_url).then(function (r) { return r.text(); });
+      return Promise.resolve(f.content);
+    }
+
+    /* what gets backed up */
+    function snapshot() {
+      return {
+        savedAt: store.get("bk.saved", 0) || Date.now(),
+        settings: settings, hist: hist, recents: recents, mode: mode, me: me,
+        auth: auth && auth.refresh_token ? { refresh_token: auth.refresh_token } : null
+      };
+    }
+    function apply(d) {
+      applying = true;
+      try {
+        settings = Object.assign({}, settings, d.settings || {}); store.set("settings", settings);
+        hist = d.hist || {}; store.set("hist", hist);
+        recents = d.recents || []; store.set("recents", recents);
+        if (d.auth && d.auth.refresh_token) { auth = { access_token: null, expires_at: 0, refresh_token: d.auth.refresh_token }; store.set("auth", auth); lastRT = auth.refresh_token; }
+        else { auth = null; store.del("auth"); lastRT = null; }
+        mode = d.mode === "user" && !auth ? null : (d.mode || null);
+        if (mode) store.set("mode", mode); else store.del("mode");
+        me = d.me || null; if (me) store.set("me", me); else store.del("me");
+        store.set("bk.saved", d.savedAt || Date.now());
+      } finally { applying = false; }
+      pruneCache();
+      if (stack.length === 1) { stack = [mk(mode ? "home" : "login")]; render(); }
+      toast("Restored from your GitHub backup");
+    }
+
+    function label() {
+      switch (st.state) {
+        case "off": return "Backup off · add ?sync=YOUR-KEY to the app address";
+        case "checking": return "Checking your GitHub backup…";
+        case "ok": return "Backed up to GitHub · " + (Date.now() - st.at < 60000 ? "just now" : ago(st.at));
+        case "offline": return "Backup waiting for a connection";
+        case "auth": return "Backup key not accepted";
+        case "different": return "Backup was made with a different key";
+        default: return "Backup isn't supported on this device";
+      }
+    }
+    function setState(s, at) {
+      st.state = s;
+      if (at) { st.at = at; store.set("bk.at", at); }
+      var el = document.querySelector(".bk");
+      if (el) { el.textContent = label(); el.className = "bk " + s; }
+    }
+    function fail(e) {
+      if (e && e.code === "auth") { setState("auth"); return; }
+      setState("offline");
+      clearTimeout(retry);
+      retry = setTimeout(function () { if (ready) push(); else start(); }, 60000);
+    }
+
+    function start() {
+      if (!token) return;
+      if (!window.crypto || !crypto.subtle || !window.TextEncoder) { setState("error"); return; }
+      setState("checking");
+      findGist().then(function (g) {
+        if (!g) { ready = true; return push(); }
+        gistId = g.id;
+        return fileText(g).then(function (text) {
+          ready = true;
+          if (!text) return push();
+          return unseal(text).then(function (snap) {
+            var localAt = store.get("bk.saved", 0);
+            if (!localAt || (snap.savedAt || 0) > localAt) { apply(snap); setState("ok", snap.savedAt); }
+            else if (localAt > (snap.savedAt || 0)) return push();
+            else setState("ok", localAt);
+          }, function () { different = true; setState("different"); });
+        });
+      }).then(function () { if (pending) { pending = false; push(); } }, fail);
+    }
+
+    function push() {
+      clearTimeout(timer); timer = null; dueAt = 0;
+      if (!token || different) return Promise.resolve();
+      if (!ready || busy) { pending = true; return Promise.resolve(); }
+      busy = true; lastPush = Date.now();
+      var snap = snapshot();
+      return seal(snap).then(function (text) {
+        var files = {}; files[FILE] = { content: text };
+        function create() {
+          return gh("POST", "/gists", { description: "GlassTube backup (encrypted)", public: false, files: files })
+            .then(function (g) { gistId = g.id; store.set("bk.id", g.id); }, function (e) { if (e.code === 404) e.code = "auth"; throw e; });
+        }
+        if (gistId) return gh("PATCH", "/gists/" + gistId, { files: files }).catch(function (e) { if (e.code === 404) { gistId = null; store.del("bk.id"); return create(); } throw e; });
+        return create();
+      }).then(function () { setState("ok", Date.now()); }, fail)
+        .then(function () { busy = false; if (pending) { pending = false; push(); } });
+    }
+
+    // important changes go up within ~3s; frequent ones (watch progress) at most once a minute
+    function schedule(frequent) {
+      try { localStorage.setItem("gt.bk.saved", JSON.stringify(Date.now())); } catch (e) {}
+      if (!token || different) return;
+      var wait = frequent ? Math.max(3000, 60000 - (Date.now() - lastPush)) : 3000;
+      var due = Date.now() + wait;
+      if (timer && dueAt <= due) return;
+      clearTimeout(timer); dueAt = due; timer = setTimeout(push, wait);
+    }
+    function changed(k, v) {
+      if (applying) return;
+      if (k === "settings" || k === "recents" || k === "mode" || k === "me") schedule(false);
+      else if (k === "hist") schedule(true);
+      else if (k === "auth") { var rt = v && v.refresh_token || null; if (rt !== lastRT) { lastRT = rt; schedule(false); } }
+    }
+
+    document.addEventListener("visibilitychange", function () { if (document.visibilityState === "hidden" && timer) push(); });
+    window.addEventListener("pagehide", function () { if (timer) push(); });
+    window.addEventListener("online", function () { if (st.state === "offline") { clearTimeout(retry); if (ready) push(); else start(); } });
+
+    return { start: start, changed: changed, label: label, state: function () { return st.state; } };
+  })();
+
   var settings = Object.assign({ hideShorts: true, sponsorBlock: true, hideWatched: false, region: CFG.REGION || "GB" }, store.get("settings", {}));
   function saveSettings() { store.set("settings", settings); }
   var hist = store.get("hist", {});
@@ -974,7 +1164,7 @@
         row(r++, "clear", "Clear watch history", "Resets progress bars on this device", ""),
         row(r++, "out", mode === "user" ? "Sign out" : "Sign in", mode === "user" ? "Disconnect your Google account" : "Connect your YouTube account", "")
       ];
-      return '<div class="scr settings">' + topbar(s) + '<div class="set-vp"><div class="vscroll" data-pad="70">' + acct + rows.join("") + '<p class="ver">GlassTube ' + VERSION + "</p></div></div></div>";
+      return '<div class="scr settings">' + topbar(s) + '<div class="set-vp"><div class="vscroll" data-pad="110">' + acct + '<p class="bk ' + Backup.state() + '">' + esc(Backup.label()) + '</p>' + rows.join("") + '<p class="ver">GlassTube ' + VERSION + "</p></div></div></div>";
     },
     defaultFocus: function () { return [1, 0]; },
     act: function (s, a) {
@@ -994,5 +1184,6 @@
   stack = [mk(mode ? "home" : "login")];
   render();
   guard();
+  Backup.start();
   if ("serviceWorker" in navigator && location.protocol === "https:") navigator.serviceWorker.register("sw.js").catch(function () {});
 })();
